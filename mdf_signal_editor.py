@@ -26,7 +26,7 @@ import numpy as np
 from asammdf import MDF, Signal
 
 APP_NAME = "MDF Signal Editor"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 DTYPES = ["auto", "uint8", "int8", "uint16", "int16", "uint32", "int32",
           "float32", "float64"]
@@ -290,6 +290,91 @@ class MdfEditor:
         return out_path
 
 
+# --------------------------------------------------------------------------
+# Signal database (CAN.py) - names offered in the "Add new signal" drop-down
+# --------------------------------------------------------------------------
+SIGNAL_DB_FILE = "CAN.py"
+
+
+def app_dir():
+    """Folder of the script (or of the .exe when frozen with PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def full_signal_name(name, prefix):
+    """'Conti_Veh_CAN.YawRate.YawRate' + prefix 'MTS.ADAS_CAN.Conti_Veh_CAN'
+    -> 'MTS.ADAS_CAN.Conti_Veh_CAN.YawRate.YawRate' (as written in the measurement)."""
+    if not prefix:
+        return name
+    first, _, rest = name.partition(".")
+    if rest and prefix.split(".")[-1] == first:
+        return f"{prefix}.{rest}"
+    return f"{prefix}.{name}"
+
+
+def load_signal_db(path):
+    """Read signal names from a generated CAN.py (or a .txt with one name per line).
+
+    CAN.py is read as text (with ast), not imported, so its own imports
+    (utils.signal_database_handler ...) are not needed.
+    """
+    import ast
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    names = []
+    if path.lower().endswith(".py"):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            lists = {}  # list variable name -> signal names
+            for node in tree.body:
+                if not isinstance(node, ast.Assign) or not isinstance(node.value, (ast.List, ast.Tuple)):
+                    continue
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if not any(t.endswith("_SIGNALS") for t in targets):
+                    continue
+                items = [el.value.strip() for el in node.value.elts
+                         if isinstance(el, ast.Constant) and isinstance(el.value, str)]
+                for t in targets:
+                    lists[t] = items
+            # prefixes from: build_tree(X__SIGNALS, prefix='MTS.ADAS_CAN.Conti_Veh_CAN')
+            prefixes = {}
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "build_tree"):
+                    continue
+                lst = node.args[0].id if node.args and isinstance(node.args[0], ast.Name) else None
+                pre = None
+                for kw in node.keywords:
+                    if kw.arg == "prefix" and isinstance(kw.value, ast.Constant):
+                        pre = kw.value.value
+                if pre is None and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    pre = node.args[1].value
+                if lst and pre:
+                    prefixes[lst] = pre
+            for lst, items in lists.items():
+                names.extend(full_signal_name(n, prefixes.get(lst)) for n in items)
+        if not names:  # fallback: any quoted dotted name
+            names = re.findall(r"""['"]([A-Za-z_]\w*(?:\.\w+)+)['"]""", text)
+    else:
+        names = [ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+    return sorted(set(n for n in names if n), key=str.lower)
+
+
+def search_names(names, query, limit=None):
+    """Case-insensitive search; every word of the query must appear in the name."""
+    words = (query or "").lower().split()
+    if not words:
+        out = list(names)
+    else:
+        out = [n for n in names if all(w in n.lower() for w in words)]
+    return out[:limit] if limit else out
+
+
 def default_output_name(path):
     base, ext = os.path.splitext(path)
     return f"{base}_modified{ext or '.mdf'}"
@@ -373,6 +458,159 @@ def run_gui():
 
     EXAMPLE = "0 0\n10 1\n58 0"
 
+    class SearchCombo(ttk.Combobox):
+        """Editable combobox with a live search list.
+
+        - Type any part of a name (several words = all must match): a list of
+          matching names opens under the box. Up/Down + Enter or a click picks one.
+        - The arrow button shows the current matches (all names when empty).
+        - Any other text can still be typed or pasted - it does not have to be
+          in the list.
+        """
+        MAX_SHOWN = 300
+
+        def __init__(self, master, textvariable, **kw):
+            super().__init__(master, textvariable=textvariable, **kw)
+            self.var = textvariable
+            self.all_names = []
+            self.popup = None
+            self.lb = None
+            self.on_change = None
+            self.bind("<KeyRelease>", self._on_key)
+            self.bind("<Down>", self._on_down)
+            self.bind("<Up>", self._on_up)
+            self.bind("<Return>", self._on_return)
+            self.bind("<Escape>", lambda e: self.hide())
+            self.bind("<FocusOut>", lambda e: self.after(150, self._maybe_hide))
+            self.bind("<<ComboboxSelected>>", lambda e: (self.hide(), self._changed()))
+            self.bind("<<Paste>>", lambda e: self.after(10, self.update_list))
+            self.winfo_toplevel().bind("<Configure>", lambda e: self.hide(), add="+")
+
+        def set_names(self, names):
+            self.all_names = list(names)
+            self["values"] = self.all_names
+
+        def matches(self):
+            return search_names(self.all_names, self.var.get())
+
+        def _changed(self):
+            if self.on_change:
+                self.on_change()
+
+        # -- popup list ---------------------------------------------------
+        def _ensure_popup(self):
+            if self.popup is not None:
+                return
+            self.popup = tk.Toplevel(self)
+            self.popup.withdraw()
+            self.popup.overrideredirect(True)
+            try:
+                self.popup.attributes("-topmost", True)
+            except Exception:
+                pass
+            fr = ttk.Frame(self.popup, borderwidth=1, relief="solid")
+            fr.pack(fill="both", expand=True)
+            self.lb = tk.Listbox(fr, font=("Consolas", 10), activestyle="dotbox",
+                                 exportselection=False, takefocus=0, borderwidth=0)
+            sb = ttk.Scrollbar(fr, orient="vertical", command=self.lb.yview)
+            self.lb.configure(yscrollcommand=sb.set)
+            self.lb.pack(side="left", fill="both", expand=True)
+            sb.pack(side="left", fill="y")
+            self.lb.bind("<ButtonRelease-1>", self._on_click)
+            self.lb.bind("<Double-Button-1>", self._on_click)
+
+        def update_list(self):
+            if str(self.cget("state")) != "normal" or not self.all_names:
+                self.hide()
+                return
+            found = self.matches()
+            self["values"] = found  # arrow button shows the same matches
+            self._changed()
+            q = self.var.get().strip()
+            if not q or not found or (len(found) == 1 and found[0] == q):
+                self.hide()
+                return
+            self._ensure_popup()
+            self.lb.delete(0, "end")
+            for n in found[:self.MAX_SHOWN]:
+                self.lb.insert("end", n)
+            if len(found) > self.MAX_SHOWN:
+                self.lb.insert("end", f"... {len(found) - self.MAX_SHOWN} more - type more to narrow")
+            rows = min(12, self.lb.size())
+            self.update_idletasks()
+            x, y = self.winfo_rootx(), self.winfo_rooty() + self.winfo_height()
+            import tkinter.font as tkfont
+            fnt = tkfont.Font(font=self.lb.cget("font"))
+            longest = max((fnt.measure(n) for n in found[:self.MAX_SHOWN]), default=0)
+            w = max(self.winfo_width(), min(longest + 40, self.winfo_screenwidth() - 20))
+            x = max(0, min(x, self.winfo_screenwidth() - w - 4))  # keep on screen
+            h = rows * (fnt.metrics("linespace") + 1) + 8
+            self.popup.geometry(f"{w}x{h}+{x}+{y}")
+            self.popup.deiconify()
+            self.popup.lift()
+
+        def visible(self):
+            return self.popup is not None and self.popup.winfo_viewable()
+
+        def hide(self):
+            if self.popup is not None:
+                self.popup.withdraw()
+
+        def _maybe_hide(self):
+            try:
+                f = self.focus_get()
+            except Exception:
+                f = None
+            if f not in (self, self.lb):
+                self.hide()
+
+        def _pick(self, idx):
+            if idx is None or idx >= self.lb.size():
+                return
+            txt = self.lb.get(idx)
+            if txt.startswith("... "):
+                return
+            self.var.set(txt)
+            self.icursor("end")
+            self.hide()
+            self.focus_set()
+            self._changed()
+
+        # -- keys ---------------------------------------------------------
+        def _on_key(self, e):
+            if e.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R",
+                            "Control_L", "Control_R", "Alt_L", "Alt_R", "Left", "Right"):
+                return
+            self.update_list()
+
+        def _move(self, step):
+            if not self.visible():
+                return None
+            cur = self.lb.curselection()
+            i = (cur[0] + step) if cur else (0 if step > 0 else self.lb.size() - 1)
+            i = max(0, min(self.lb.size() - 1, i))
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(i)
+            self.lb.activate(i)
+            self.lb.see(i)
+            return "break"
+
+        def _on_down(self, e):
+            return self._move(1)  # None -> normal combobox drop-down opens
+
+        def _on_up(self, e):
+            return self._move(-1)
+
+        def _on_return(self, e):
+            if self.visible() and self.lb.curselection():
+                self._pick(self.lb.curselection()[0])
+                return "break"
+            self.hide()
+            return None
+
+        def _on_click(self, e):
+            self._pick(self.lb.nearest(e.y))
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -444,8 +682,16 @@ def run_gui():
             r = 0
             ttk.Label(g, text="Signal name:").grid(row=r, column=0, sticky="w", pady=2)
             self.name = tk.StringVar()
-            self.name_entry = ttk.Entry(g, textvariable=self.name)
+            self.name_entry = SearchCombo(g, textvariable=self.name)
             self.name_entry.grid(row=r, column=1, sticky="ew", pady=2)
+            self.name_entry.on_change = self.update_db_hint
+            r += 1
+            dbf = ttk.Frame(g)
+            dbf.grid(row=r, column=1, sticky="ew")
+            self.db_hint = ttk.Label(dbf, text="", foreground="#666")
+            self.db_hint.pack(side="left")
+            self.db_btn = ttk.Button(dbf, text="Signal list...", command=self.choose_db)
+            self.db_btn.pack(side="right")
             r += 1
             self.tb_lbl = ttk.Label(g, text="Time base:")
             self.tb_lbl.grid(row=r, column=0, sticky="w", pady=2)
@@ -532,7 +778,55 @@ def run_gui():
                        command=self.save).pack(side="right")
             self.status = ttk.Label(sv, text="Open an MDF file to start.")
             self.status.pack(side="left")
+            self.db_names = []
+            self.db_path = None
+            default_db = os.path.join(app_dir(), SIGNAL_DB_FILE)
+            if os.path.isfile(default_db):
+                self.load_db(default_db, quiet=True)
             self.refresh_form()
+
+        # ---------------------------------------------------------- signal list (CAN.py)
+        def load_db(self, path, quiet=False):
+            try:
+                names = load_signal_db(path)
+            except Exception as e:
+                if not quiet:
+                    messagebox.showerror(APP_NAME, f"Could not read the signal list:\n{e}")
+                return
+            if not names and not quiet:
+                messagebox.showwarning(APP_NAME, "No signal names found in that file.")
+                return
+            self.db_names = names
+            self.db_path = path
+            self.name_entry.set_names(names)
+            self.update_db_hint()
+
+        def choose_db(self):
+            path = filedialog.askopenfilename(
+                title="Choose signal list (CAN.py or .txt with one name per line)",
+                initialdir=os.path.dirname(self.db_path) if self.db_path else app_dir(),
+                filetypes=[("Signal list", "*.py *.txt"), ("All files", "*.*")])
+            if path:
+                self.load_db(path)
+
+        def update_db_hint(self):
+            if self.action.get() != "add":
+                self.db_hint.config(text="")
+                return
+            if not self.db_names:
+                self.db_hint.config(text="No CAN.py signal list loaded - type the name.")
+                return
+            q = self.name.get().strip()
+            src = os.path.basename(self.db_path)
+            if not q:
+                txt = f"{len(self.db_names)} signals from {src} - type to search, or enter any name"
+            elif q in self.db_names:
+                txt = f"✓ signal from {src}"
+            else:
+                n = len(search_names(self.db_names, q))
+                txt = (f"{n} match(es) in {src}" if n else
+                       f"Not in {src} - will be added with the name as typed")
+            self.db_hint.config(text=txt)
 
         # ---------------------------------------------------------- actions
         def set_status(self, txt):
@@ -599,6 +893,10 @@ def run_gui():
             add = act == "add"
             dele = act == "delete"
             self.name_entry.config(state="normal" if add else "readonly")
+            self.name_entry.hide()
+            # CAN.py names are only offered when adding a new signal
+            self.name_entry["values"] = self.name_entry.matches() if add else []
+            self.db_btn.config(state="normal" if add else "disabled")
             for w in (self.rb_ref, self.rb_rate):
                 w.config(state="normal" if add else "disabled")
             self.ref_cb.config(state="readonly" if add and self.tb_mode.get() == "ref" else "disabled")
@@ -619,6 +917,9 @@ def run_gui():
             else:
                 sel = self.tree.selection()
                 self.name.set(sel[0] if sel else "")
+            if add:
+                self.name_entry["values"] = self.name_entry.matches()
+            self.update_db_hint()
 
         def current_change(self):
             if not self.ed:
